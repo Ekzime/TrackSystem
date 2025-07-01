@@ -5,14 +5,88 @@ import numpy as np
 from ultralytics import YOLO
 from pythonosc.udp_client import SimpleUDPClient
 
-def get_neck_mount_point(keypoints, confidences, neck_to_head_ratio=0.3):
+def detect_head_rotation(keypoints, confidences):
+    """
+    Определяет угол поворота головы через анализ ушей
+    
+    Args:
+        keypoints: массив координат ключевых точек [x, y]
+        confidences: массив уверенности для каждой точки
+    
+    Returns:
+        float: коэффициент поворота (-1.0 до 1.0)
+               -1.0 = поворот вправо (видно левое ухо)
+               0.0 = анфас (оба уха видны одинаково)  
+               1.0 = поворот влево (видно правое ухо)
+    """
+    LEFT_EAR_IDX = 3
+    RIGHT_EAR_IDX = 4
+    NOSE_IDX = 0
+    
+    MIN_CONFIDENCE = 0.3
+    
+    try:
+        left_ear_conf = confidences[LEFT_EAR_IDX]
+        right_ear_conf = confidences[RIGHT_EAR_IDX]
+        nose_conf = confidences[NOSE_IDX]
+        
+        # Если нос не виден, не можем определить поворот
+        if nose_conf < MIN_CONFIDENCE:
+            return 0.0
+            
+        # Разность уверенности ушей
+        ear_conf_diff = right_ear_conf - left_ear_conf
+        
+        # Нормализация в диапазон [-1, 1]  
+        max_diff = 1.0  # максимальная разность уверенности
+        rotation_coeff = np.clip(ear_conf_diff / max_diff, -1.0, 1.0)
+        
+        return rotation_coeff
+        
+    except (IndexError, TypeError):
+        return 0.0
+
+def get_adaptive_ratio(rotation_coeff):
+    """
+    Вычисляет адаптивный коэффициент смещения на основе поворота головы
+    
+    Args:
+        rotation_coeff: коэффициент поворота от detect_head_rotation (-1.0 до 1.0)
+    
+    Returns:
+        float: адаптивный коэффициент для neck_to_head_ratio
+    """
+    # Базовые коэффициенты для разных поворотов
+    FRONTAL_RATIO = 0.35    # анфас
+    SLIGHT_TURN_RATIO = 0.25  # легкий поворот
+    STRONG_TURN_RATIO = 0.15  # сильный поворот
+    PROFILE_RATIO = 0.08      # профиль
+    
+    abs_rotation = abs(rotation_coeff)
+    
+    if abs_rotation < 0.2:  # анфас
+        return FRONTAL_RATIO
+    elif abs_rotation < 0.5:  # легкий поворот
+        # Интерполяция между анфас и легким поворотом
+        t = (abs_rotation - 0.2) / 0.3
+        return FRONTAL_RATIO * (1 - t) + SLIGHT_TURN_RATIO * t
+    elif abs_rotation < 0.8:  # сильный поворот
+        # Интерполяция между легким и сильным поворотом  
+        t = (abs_rotation - 0.5) / 0.3
+        return SLIGHT_TURN_RATIO * (1 - t) + STRONG_TURN_RATIO * t
+    else:  # профиль
+        # Интерполяция между сильным поворотом и профилем
+        t = (abs_rotation - 0.8) / 0.2
+        return STRONG_TURN_RATIO * (1 - t) + PROFILE_RATIO * t
+
+def get_neck_mount_point(keypoints, confidences, adaptive_ratio):
     """
     Вычисляет стабильную точку крепления между плечами по направлению к носу
     
     Args:
         keypoints: массив координат ключевых точек [x, y]
         confidences: массив уверенности для каждой точки
-        neck_to_head_ratio: коэффициент смещения от плеч к носу (0.0-1.0)
+        adaptive_ratio: адаптивный коэффициент смещения от плеч к носу
     
     Returns:
         tuple (x, y) или None если данные недостаточны
@@ -43,8 +117,8 @@ def get_neck_mount_point(keypoints, confidences, neck_to_head_ratio=0.3):
         # Вектор от плеч к носу
         shoulder_to_nose = nose - shoulder_midpoint
         
-        # Финальная точка крепления
-        neck_mount_point = shoulder_midpoint + (shoulder_to_nose * neck_to_head_ratio)
+        # Финальная точка крепления с адаптивным коэффициентом
+        neck_mount_point = shoulder_midpoint + (shoulder_to_nose * adaptive_ratio)
         
         return tuple(neck_mount_point.astype(int))
         
@@ -96,6 +170,21 @@ class PointStabilizer:
             return None
         return tuple(self.stable_point.astype(int))
 
+class ValueStabilizer:
+    """
+    Стабилизатор для числовых значений (например, коэффициента поворота)
+    """
+    def __init__(self, alpha=0.6):
+        self.alpha = alpha
+        self.stable_value = None
+        
+    def update(self, new_value):
+        if self.stable_value is None:
+            self.stable_value = new_value 
+        else:
+            self.stable_value = self.alpha * new_value + (1 - self.alpha) * self.stable_value
+        return self.stable_value
+
 class PoseTracker:
     def __init__(self):
         # Принудительно используем только GPU
@@ -126,8 +215,10 @@ class PoseTracker:
         # Данные для OSC
         self.osc_data = {'neck_mount': None}
         
-        # Стабилизатор точки крепления
+        # Стабилизаторы
         self.neck_stabilizer = PointStabilizer(alpha=0.6)
+        self.rotation_stabilizer = ValueStabilizer(alpha=0.5)
+        self.ratio_stabilizer = ValueStabilizer(alpha=0.4)
         
         # OSC клиент
         self.osc_client = SimpleUDPClient("127.0.0.1", 9001)
@@ -167,9 +258,20 @@ class PoseTracker:
             
             # Обработка keypoints для расчета точки крепления
             raw_neck_mount = None
+            rotation_coeff = 0.0
+            adaptive_ratio = 0.3
+            
             if keypoints_data is not None and confidences_data is not None:
-                # Вычисляем сырую точку крепления
-                raw_neck_mount = get_neck_mount_point(keypoints_data, confidences_data, neck_to_head_ratio=0.3)
+                # Определяем поворот головы
+                raw_rotation = detect_head_rotation(keypoints_data, confidences_data)
+                rotation_coeff = self.rotation_stabilizer.update(raw_rotation)
+                
+                # Вычисляем адаптивный коэффициент
+                raw_ratio = get_adaptive_ratio(rotation_coeff)
+                adaptive_ratio = self.ratio_stabilizer.update(raw_ratio)
+                
+                # Вычисляем сырую точку крепления с адаптивным коэффициентом
+                raw_neck_mount = get_neck_mount_point(keypoints_data, confidences_data, adaptive_ratio)
             
             # Стабилизируем координаты
             stable_neck_mount = self.neck_stabilizer.update(raw_neck_mount)
@@ -226,6 +328,15 @@ class PoseTracker:
             color = (0, 255, 0) if self.osc_data['neck_mount'] is not None else (0, 0, 255)
             cv2.putText(annotated_frame, f'Neck Mount: {status}', (10, 90), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+            # Показываем информацию о повороте и адаптивном коэффициенте
+            rotation_text = f'Rotation: {rotation_coeff:.2f}'
+            cv2.putText(annotated_frame, rotation_text, (10, 150), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            ratio_text = f'Adaptive Ratio: {adaptive_ratio:.2f}'
+            cv2.putText(annotated_frame, ratio_text, (10, 180), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             cv2.imshow('YOLO v8 Pose Tracking', annotated_frame)
             
